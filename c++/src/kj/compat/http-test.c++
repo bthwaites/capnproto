@@ -2926,6 +2926,142 @@ KJ_TEST("HttpServer cancels request when client disconnects") {
   cancelPromise.wait(waitScope);
 }
 
+class DummyService final: public HttpService {
+public:
+  DummyService(HttpHeaderTable& headerTable): headerTable(headerTable) {}
+
+  kj::Promise<void> request(
+      HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody, Response& response) override {
+    if (!headers.isWebSocket()) {
+      if (url == "/throw") {
+        return KJ_EXCEPTION(FAILED, "client requested failure");
+      }
+
+      auto body = kj::str(headers.get(HttpHeaderId::HOST).orDefault("null"), ":", url);
+      auto stream = response.send(200, "OK", HttpHeaders(headerTable), body.size());
+      auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+      promises.add(stream->write(body.begin(), body.size()));
+      promises.add(requestBody.readAllBytes().ignoreResult());
+      return kj::joinPromises(promises.finish()).attach(kj::mv(stream), kj::mv(body));
+    } else {
+      auto ws = response.acceptWebSocket(HttpHeaders(headerTable));
+      auto body = kj::str(headers.get(HttpHeaderId::HOST).orDefault("null"), ":", url);
+      auto sendPromise = ws->send(body);
+
+      auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+      promises.add(sendPromise.attach(kj::mv(body)));
+      promises.add(ws->receive().ignoreResult());
+      return kj::joinPromises(promises.finish()).attach(kj::mv(ws));
+    }
+  }
+
+private:
+  HttpHeaderTable& headerTable;
+};
+
+KJ_TEST("HttpServer can suspend a request") {
+  // This test sends a single request to an HttpServer three times. First it writes the request to
+  // its pipe and arranges for the HttpServer to suspend the request. Then it resumes the suspended
+  // request and arranges for this resumption to be suspended as well. Then it resumes once more and
+  // arranges for the request to be completed.
+
+  KJ_HTTP_TEST_SETUP_IO;
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+
+  HttpHeaderTable table;
+  // This HttpService will not actually be used, because we're passing a factory in to
+  // listenHttpCleanDrain().
+  HangingHttpService service;
+  HttpServer server(timer, table, service);
+
+  kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
+
+  // A SuspendableHttpServiceFactory which always suspends, saving the request in
+  // `suspendedRequest`.
+  auto alwaysSuspend = [&](HttpServer::SuspendableRequest& sr) {
+    suspendedRequest = sr.suspend();
+    return nullptr;
+  };
+
+  DummyService dummyService(table);
+  // A SuspendableHttpServiceFactory which always returns `dummyService`.
+  auto dummyServiceFactory = [&](HttpServer::SuspendableRequest&) {
+    return kj::Own<HttpService>(&dummyService, kj::NullDisposer::instance);
+  };
+
+  {
+    // Observe the HttpServer suspend.
+
+    auto listenPromise = server.listenHttpCleanDrain(*pipe.ends[0], alwaysSuspend);
+
+    // We must use a Content-Length body so that the HttpServer is able to drain later on.
+    static constexpr kj::StringPtr REQUEST =
+        "POST / HTTP/1.1\r\n"
+        "Content-Length: 6\r\n"
+        "\r\n"
+        "foobar"_kj;
+    pipe.ends[1]->write(REQUEST.begin(), REQUEST.size()).wait(waitScope);
+
+    // The listen promise is fulfilled with false.
+    KJ_EXPECT(listenPromise.poll(waitScope));
+    KJ_EXPECT(!listenPromise.wait(waitScope));
+
+    // And we have a SuspendedRequest.
+    KJ_EXPECT(suspendedRequest != nullptr);
+  }
+
+  {
+    // Observe the HttpServer suspend again without reading from the connection.
+
+    auto listenPromise = server.listenHttpCleanDrain(
+        *pipe.ends[0], alwaysSuspend, kj::mv(suspendedRequest));
+
+    suspendedRequest = nullptr;
+
+    // The listen promise is again fulfilled with false.
+    KJ_EXPECT(listenPromise.poll(waitScope));
+    KJ_EXPECT(!listenPromise.wait(waitScope));
+
+    // Our SuspendedRequest was put back.
+    KJ_EXPECT(suspendedRequest != nullptr);
+  }
+
+  {
+    // The SuspendedRequest is completed.
+
+    auto listenPromise = server.listenHttpCleanDrain(
+        *pipe.ends[0], dummyServiceFactory, kj::mv(suspendedRequest));
+
+    suspendedRequest = nullptr;
+
+    auto drainPromise = kj::evalLast([&]() {
+      return server.drain();
+    });
+
+    // We need to read the response for the HttpServer to drain.
+    auto readPromise = pipe.ends[1]->readAllText();
+
+    // This time, the server drained cleanly.
+    KJ_EXPECT(listenPromise.poll(waitScope));
+    KJ_EXPECT(listenPromise.wait(waitScope));
+
+    drainPromise.wait(waitScope);
+
+    // Close the server side of the pipe so our read promise completes.
+    pipe.ends[0] = nullptr;
+
+    auto response = readPromise.wait(waitScope);
+    static constexpr kj::StringPtr RESPONSE =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 6\r\n"
+        "\r\n"
+        "null:/"_kj;
+    KJ_EXPECT(RESPONSE == response);
+  }
+}
+
 // -----------------------------------------------------------------------------
 
 KJ_TEST("newHttpService from HttpClient") {
@@ -3413,40 +3549,6 @@ private:
   kj::Network& inner;
   uint& count;
   uint& addrCount;
-};
-
-class DummyService final: public HttpService {
-public:
-  DummyService(HttpHeaderTable& headerTable): headerTable(headerTable) {}
-
-  kj::Promise<void> request(
-      HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
-      kj::AsyncInputStream& requestBody, Response& response) override {
-    if (!headers.isWebSocket()) {
-      if (url == "/throw") {
-        return KJ_EXCEPTION(FAILED, "client requested failure");
-      }
-
-      auto body = kj::str(headers.get(HttpHeaderId::HOST).orDefault("null"), ":", url);
-      auto stream = response.send(200, "OK", HttpHeaders(headerTable), body.size());
-      auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
-      promises.add(stream->write(body.begin(), body.size()));
-      promises.add(requestBody.readAllBytes().ignoreResult());
-      return kj::joinPromises(promises.finish()).attach(kj::mv(stream), kj::mv(body));
-    } else {
-      auto ws = response.acceptWebSocket(HttpHeaders(headerTable));
-      auto body = kj::str(headers.get(HttpHeaderId::HOST).orDefault("null"), ":", url);
-      auto sendPromise = ws->send(body);
-
-      auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
-      promises.add(sendPromise.attach(kj::mv(body)));
-      promises.add(ws->receive().ignoreResult());
-      return kj::joinPromises(promises.finish()).attach(kj::mv(ws));
-    }
-  }
-
-private:
-  HttpHeaderTable& headerTable;
 };
 
 KJ_TEST("HttpClient connection management") {
